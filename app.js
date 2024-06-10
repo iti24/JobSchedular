@@ -1,112 +1,216 @@
-const express = require('express');
-const cron = require('node-cron');
-const knex = require('knex');
-const axios = require('axios');
-const Oauth1Helper = require("./signature");
-
-const app = express();
+const express = require('express')
+const app = express()
 const port = 4000;
 
+app.get('/test', (req, res) => {
+    res.send('Hello World!')
+})
+const knex = require('knex')
+const axios = require('axios');
+const Oauth1Helper = require("./signature");
 const dbConfig = {
     client: 'mssql',
     connection: {
-        server: "",
+        server: "43.205.186.2",
         port: 1433,
-        user: "",
-        password: "",
+        user: "sa",
+        password: "Sa@8811$",
         database: "BWC_Datamart",
     },
     acquireConnectionTimeout: 60000,
     pool: { min: 0, max: 10000 },
 };
-
+// const knex = require("knex")(dbConfig);
 axios.defaults.timeout = 180000;
+const moment = require('moment');
+const cron = require('node-cron');
 
-app.get('/test', (req, res) => {
-    res.send('Hello World!');
+app.get("/improvised", async (req, res) => {
+    const db = knex(dbConfig);
+    console.log("Procedure execution starts");
+
+    const paymentRows = await db.select("*").from("sales_table_to_erp").whereIn("status", ["Not_Updated", "Failure"]);
+    console.log(paymentRows.length);
+
+    const batches = chunkArray(paymentRows, 20); // Batch size can be adjusted
+    for (const batch of batches) {
+        await processBatch(batch, db);
+    }
+
+    await db.destroy();
+    res.end();
 });
 
-app.get("/", async (req, res) => {
-    console.log("Procedure execution starts");
-    let dataToInsert = [];
-    const knex = require("knex")(dbConfig);
-    try {
-        const inventory_table = await knex.select("*")
-            .from("consumption_table_to_erp")
-            .andWhere('store_code', 'C/001')
-            .andWhere('date', '01-03-2024')
-            .whereIn("status", ["Not_Updated", "Failure"]);
-        console.log(inventory_table.length);
+async function processBatch(batch, db) {
+    let apiPromises = [];
+    let responsesMap = new Map();
 
-        for (const dataObject of inventory_table) {
-            let erpItemsDetails = JSON.stringify({
-                "sysId": dataObject.sysid,
-                "storeCode": dataObject.store_code,
-                "lineOfBusiness": dataObject.lineOfBusiness,
-                "dept": dataObject.dept,
-                "businessVertical": dataObject.businessVertical,
-                "itemDtls": [{
-                    "itemCode": dataObject.itemCode,
-                    "quantity": dataObject.quantity
-                }],
-                "txnDate": dataObject.date,
-            });
+    for (const dataObject of batch) {
+        const systemdata = prepareSystemData(dataObject);
+        const config = {
+            method: 'post',
+            maxBodyLength: Infinity,
+            url: 'https://5749239-sb1.restlets.api.netsuite.com/app/site/hosting/restlet.nl?script=298&deploy=1',
+        };
 
-            let config = {
-                method: 'post',
-                maxBodyLength: Infinity,
-                url: 'https://5749239-sb1.restlets.api.netsuite.com/app/site/hosting/restlet.nl?script=299&deploy=1',
-            };
+        const oauth = Oauth1Helper.getAuthHeaderForRequest(config);
+        const headerSet = {
+            'Authorization': oauth.Authorization,
+            'Content-Type': 'application/json'
+        };
 
-            const oauth = Oauth1Helper.getAuthHeaderForRequest(config);
+        const apiUrl = 'https://5749239-sb1.restlets.api.netsuite.com/app/site/hosting/restlet.nl?script=298&deploy=1';
 
-            let headerSet = {
-                'Authorization': oauth.Authorization,
-                'Content-Type': 'application/json'
-            };
-
-            axios.request({
-                method: 'post',
-                maxBodyLength: Infinity,
-                url: 'https://5749239-sb1.restlets.api.netsuite.com/app/site/hosting/restlet.nl?script=299&deploy=1',
-                headers: headerSet,
-                data: erpItemsDetails
-            })
-                .then(async (response) => {
-                    console.log(JSON.stringify(response.data));
-                    const resp = JSON.parse(JSON.stringify(response.data));
-                    if (resp.success == "N") {
-                        await knex('consumption_table_to_erp').where('sysid', dataObject.sysid).update({
-                            status: 'Failure',
-                            Error_log: JSON.stringify(response.data)
-                        });
-                    } else {
-                        await knex('consumption_table_to_erp').where('sysid', dataObject.sysid).update({
-                            status: 'Success',
-                            Error_log: JSON.stringify(response.data)
-                        });
-                    }
-                })
-                .catch((error) => {
-                    console.log(error);
+        apiPromises.push(apiCalling(apiUrl, headerSet, systemdata).then(response => {
+            responsesMap.set(dataObject.sysid, response); // Store sysid-response pair in the map
+        }).catch(error => {
+            // Handle errors here if needed
+            console.error("Error for sysid:", dataObject.sysid, error);
+        }));
+    }
+    await Promise.all(apiPromises);
+    // Now you can access the response for a particular sysid from the map
+    for (const [sysid, response] of responsesMap.entries()) {
+        console.log(`Response for sysid ${sysid}:`, response);
+        if (response) {
+            if (response.success == "Y") {
+                await db('sales_table_to_erp').where('sysid', sysid).update({
+                    status: 'Success',
+                    Error_log: JSON.stringify(response)
                 });
+            } else if (response.success == "N") {
+                await db('sales_table_to_erp').where('sysid', sysid).update({
+                    status: 'Failure',
+                    Error_log: JSON.stringify(response)
+                });
+            }
         }
-        console.log("API CALLLS COMPLETE");
+    }
+}
 
-        await knex.destroy();
+function prepareSystemData(dataObject) {
+    return JSON.stringify({
+        "sysId": dataObject.sysid,
+        "cstmr": dataObject.cstmr,
+        "storeCode": dataObject.storeCode,
+        "dept": dataObject.dept,
+        "lineOfBusiness": dataObject.lineOfBusiness,
+        "businessVertical": dataObject.businessVertical,
+        "paymentMethod": dataObject.payment_mode,
+        "placeOfSupply": dataObject.placeOfSupply,
+        "memo": dataObject.memo,
+        "invDate": dataObject.date,
+        "itemDtls": [
+            {
+                "itemCode": dataObject.itemCode,
+                "itemDescription": dataObject.itemDescription,
+                "quantity": dataObject.quantity,
+                "hsnSac": dataObject.hsnSac,
+                "unitPrice": dataObject.unitPrice,
+                "taxableAmt": parseFloat(dataObject.taxableAmt).toFixed(2),
+                "taxCode": dataObject.taxCode,
+                "gstRate": parseFloat(dataObject.gstRate).toFixed(2),
+                "cgstAmt": parseFloat(dataObject.cgstAmt).toFixed(2),
+                "sgstAmt": parseFloat(dataObject.sgstAmt).toFixed(2),
+                "igstAmt": parseFloat(dataObject.igstAmt).toFixed(2),
+                "cessRate": parseFloat(dataObject.cessRate).toFixed(2),
+                "cessAmt": 0,
+                "stateCessRate": parseFloat(dataObject.stateCessRate).toFixed(2),
+                "stateCessAmt": parseFloat(dataObject.stateCessAmt).toFixed(2),
+                "tcsRate": parseFloat(dataObject.tcsRate).toFixed(2),
+                "tcsAmt": parseFloat(dataObject.tcsAmt).toFixed(2),
+                "isReverseCharge": "N"
+            },
+        ]
+    });
+}
+
+function chunkArray(arr, size) {
+    const chunkedArr = [];
+    for (let i = 0; i < arr.length; i += size) {
+        chunkedArr.push(arr.slice(i, i + size));
+    }
+    return chunkedArr;
+}
+
+/**
+ * This endpoint will process the consumption data in a more optimized way
+ */
+
+app.post("/consumption", async (req, res) => {
+    try {
+        const db = knex(dbConfig);
+        const thisDate = moment().format('DD-MM-YYYY');
+        console.log(`CONSUMPTION PROCESS STARTED : ${thisDate}`);
+        const responses = await db.distinct().from('consumption_table_to_erp').pluck('sysid');
+        for (const singleStore of responses) {
+            const inventory_table = await db.select("*").from("consumption_table_to_erp").andWhere('sysid', singleStore).whereIn("status", ["Not_Updated"]);
+            if (!inventory_table.length) {
+                continue;
+            } else {
+                console.log(`Sysid :${singleStore}  || Transactions :${inventory_table.length}`);
+            }
+            const response = await processBatchConsumption2(inventory_table, db);
+
+            let insertData = {
+                sysid: singleStore,
+                store_code: '',
+                error_log: JSON.stringify(response),
+                status: response.success == "Y" ? 'Success' : "Failure",
+                report_date: thisDate
+            }
+            await db('consumption_batch_response').insert(insertData);
+        }
+        await db.destroy();
+        await updateConsumption(thisDate);
+        console.log(`CONSUMPTION PROCESS COMPLETED : ${thisDate}`);
         res.end();
     } catch (error) {
-        console.log(error);
-        for (const data of dataToInsert) {
-            await knex('consumption_table_to_erp').where('sysid', data.sysid).update({
-                status: data.status,
-                Error_log: data.Error_log
-            });
-        }
-        await knex.destroy();
+        console.log(error)
         res.end();
     }
 });
+
+async function processBatchConsumption2(batch, db) {
+    try {
+        let queryObject = {
+            "sysId": batch[0].sysid,
+            "storeCode": batch[0].store_code,
+            "lineOfBusiness": batch[0].lineOfBusiness,
+            "dept": batch[0].dept,
+            "businessVertical": batch[0].businessVertical,
+            "itemDtls": [],
+            "txnDate": batch[0].date,
+
+        }
+        for (const dataObject of batch) {
+            queryObject.itemDtls.push({
+                "itemCode": dataObject.itemCode,
+                "quantity": dataObject.quantity,
+                "consumptionType": "Consumption"
+            })
+        }
+        const config = {
+            method: 'post',
+            maxBodyLength: Infinity,
+            url: 'https://5749239-sb1.restlets.api.netsuite.com/app/site/hosting/restlet.nl?script=299&deploy=1',
+        };
+
+        const oauth = Oauth1Helper.getAuthHeaderForRequest(config);
+        const headerSet = {
+            'Authorization': oauth.Authorization,
+            'Content-Type': 'application/json'
+        };
+
+        const apiUrl = 'https://5749239-sb1.restlets.api.netsuite.com/app/site/hosting/restlet.nl?script=299&deploy=1';
+        const response = await apiCalling(apiUrl, headerSet, queryObject)
+        console.log(response)
+        return response;
+    } catch (error) {
+        console.log(error.data)
+        return error;
+    }
+}
 
 const apiCalling = async (url, headerSet, erpItemsDetails) => {
     return new Promise(async (resolve, reject) => {
@@ -126,90 +230,29 @@ const apiCalling = async (url, headerSet, erpItemsDetails) => {
     })
 }
 
-app.get("/improvisedConsumption", async (req, res) => {
+const updateConsumption = async (reportDate) => {
     const db = knex(dbConfig);
-    console.log("Procedure execution starts");
-    let storeCodes = ['C/008', 'C/009', 'C/010', 'C/016', 'C/022', 'C/024', 'C/033', 'C/038', 'C/047', 'C/053', 'C/058', 'C/059', 'C/066', 'C/069', 'C/070', 'C/076', 'C/077', 'C/083', 'C/084', 'C/085', 'C/088', 'C/092', 'C/094', 'C/103', 'C/104', 'C/113', 'C/125', 'C/127', 'C/139', 'C/145', 'C/147', 'C/150', 'C/151', 'C/152', 'C/158', 'C/165', 'C/166', 'C/167', 'C/177', 'C/184', 'C/185', 'C/186', 'C/194', 'C/195', 'C/196', 'C/207', 'C/218', 'C/219', 'C/220', 'F/002', 'F/018', 'F/023', 'F/024', 'F/034', 'F/039', 'F/057', 'F/072', 'F/080', 'F/085', 'F/090', 'F/095', 'F/103', 'F/110', 'F/111', 'F/128', 'F/133', 'F/137', 'F/140', 'F/141', 'F/142', 'F/150', 'F/161', 'F/166', 'F/169', 'F/170', 'F/171', 'F/176', 'F/185', 'F/188', 'F/194', 'F/198', 'F/201', 'F/204', 'F/211', 'F/215', 'F/226', 'F/233', 'F/234', 'F/243', 'F/249', 'F/255', 'F/256', 'F/263', 'F/269', 'F/272', 'F/277', 'F/278', 'F/279', 'F/283', 'F/289', 'F/291', 'F/294', 'F/302', 'F/308', 'F/311', 'F/312', 'F/318', 'F/321', 'F/322', 'F/335', 'F/336', 'F/342', 'F/348', 'F/352', 'F/358', 'F/360', 'F/361', 'F/362', 'F/378', 'C/007', 'C/017', 'C/021', 'C/023', 'C/025', 'C/028', 'C/029', 'C/037', 'C/040', 'C/046', 'C/057', 'C/067', 'C/081', 'C/082', 'C/089', 'C/091', 'C/093', 'C/095', 'C/098', 'C/099', 'C/105', 'C/107', 'C/110', 'C/112', 'C/114', 'C/115', 'C/126', 'C/128', 'C/129', 'C/130', 'C/131', 'C/132', 'C/133', 'C/146', 'C/148', 'C/149', 'C/156', 'C/159', 'C/168', 'C/176', 'C/178', 'C/179', 'C/187', 'C/197', 'C/206', 'C/217', 'C/221', 'C/222', 'F/006', 'F/008', 'F/009', 'F/016', 'F/022', 'F/040', 'F/041', 'F/047', 'F/058', 'F/062', 'F/069', 'F/073', 'F/076', 'F/078', 'F/091', 'F/102', 'F/104', 'F/105', 'F/108', 'F/132', 'F/134', 'F/138', 'F/189', 'F/195', 'F/199', 'F/205', 'F/218', 'F/220', 'F/227', 'F/228', 'F/229', 'F/232', 'F/235', 'F/242', 'F/244', 'F/246', 'F/250', 'F/251', 'F/252', 'F/258', 'F/260', 'F/265', 'F/270', 'F/271', 'F/276', 'F/284', 'F/285', 'F/286', 'F/292', 'F/293', 'F/295', 'F/297', 'F/298', 'F/305', 'F/307', 'F/310', 'F/319', 'F/320', 'F/324', 'F/325', 'F/326', 'F/327', 'F/329', 'F/332', 'F/333', 'F/334', 'F/338', 'F/339', 'F/340', 'F/349', 'F/351', 'F/354', 'F/363'];
+    const responses = await db.select("*").from("consumption_batch_response").andWhere('report_date', reportDate);
+    for (const singleItem of responses) {
+        await db('consumption_table_to_erp').where('sysid', singleItem.sysid).update({
+            status: singleItem.status,
+            Error_log: singleItem.error_log
+        });
+    }
+    await db.destroy();
+    res.end();
+}
 
+// Schedule cron job to run at 3:45 PM every day
+cron.schedule('45 15 * * *', async () => {
     try {
-        for (let storeCode of storeCodes) {
-            let consumption_data = await db('consumption_table_to_erp')
-                .select('*')
-                .where('store_code', storeCode)
-                .whereIn('status', ['Not_Updated', 'Failure'])
-                .limit(10);
-
-            if (consumption_data.length > 0) {
-                for (let dataObject of consumption_data) {
-                    let erpItemsDetails = JSON.stringify({
-                        "sysId": dataObject.sysid,
-                        "storeCode": dataObject.store_code,
-                        "lineOfBusiness": dataObject.lineOfBusiness,
-                        "dept": dataObject.dept,
-                        "businessVertical": dataObject.businessVertical,
-                        "itemDtls": [{
-                            "itemCode": dataObject.itemCode,
-                            "quantity": dataObject.quantity
-                        }],
-                        "txnDate": dataObject.date,
-                    });
-
-                    let config = {
-                        method: 'post',
-                        maxBodyLength: Infinity,
-                        url: 'https://5749239-sb1.restlets.api.netsuite.com/app/site/hosting/restlet.nl?script=299&deploy=1',
-                    };
-
-                    const oauth = Oauth1Helper.getAuthHeaderForRequest(config);
-
-                    let headerSet = {
-                        'Authorization': oauth.Authorization,
-                        'Content-Type': 'application/json'
-                    };
-
-                    try {
-                        let response = await apiCalling('https://5749239-sb1.restlets.api.netsuite.com/app/site/hosting/restlet.nl?script=299&deploy=1', headerSet, erpItemsDetails);
-
-                        if (response.success === "N") {
-                            await db('consumption_table_to_erp').where('sysid', dataObject.sysid).update({
-                                status: 'Failure',
-                                Error_log: JSON.stringify(response)
-                            });
-                        } else {
-                            await db('consumption_table_to_erp').where('sysid', dataObject.sysid).update({
-                                status: 'Success',
-                                Error_log: JSON.stringify(response)
-                            });
-                        }
-                    } catch (error) {
-                        console.log(error);
-                    }
-                }
-            }
-        }
-        console.log("API CALLLS COMPLETE");
-
-        await db.destroy();
-        res.end();
+        const response = await axios.post('http://localhost:4000/consumption');
+        console.log('Cron job executed successfully');
     } catch (error) {
-        console.log(error);
-        await db.destroy();
-        res.end();
+        console.error('Error executing cron job:', error);
     }
 });
 
-// Schedule a task to run every day at 3 PM
-cron.schedule('0 15 * * *', () => {
-    console.log('Running a task every day at 3 PM');
-    axios.get('http://localhost:4000/improvisedConsumption')
-        .then(response => {
-            console.log('Cron job executed successfully');
-        })
-        .catch(error => {
-            console.error('Error executing cron job:', error);
-        });
-});
-
 app.listen(port, () => {
-    console.log(`Example app listening at http://localhost:${port}`);
-});
+    console.log(`Example app listening on port ${port}`)
+})
